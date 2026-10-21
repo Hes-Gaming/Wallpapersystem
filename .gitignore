@@ -1,0 +1,5 @@
+build/
+WallpaperSystem.exe
+wallpaper.log
+*.pdb
+.vs/
