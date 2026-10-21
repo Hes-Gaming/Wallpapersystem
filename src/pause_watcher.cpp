@@ -24,25 +24,6 @@ bool ContainsRect(const RECT& outer, const RECT& inner)
            outer.right >= inner.right && outer.bottom >= inner.bottom;
 }
 
-struct PrimaryMonitorSearch
-{
-    MONITORINFO info;
-    bool found;
-};
-
-BOOL CALLBACK EnumPrimaryMonitorProc(HMONITOR monitor, HDC, LPRECT, LPARAM param)
-{
-    MONITORINFO info = { sizeof(info) };
-    if (GetMonitorInfoW(monitor, &info) && (info.dwFlags & MONITORINFOF_PRIMARY) != 0)
-    {
-        PrimaryMonitorSearch* search = reinterpret_cast<PrimaryMonitorSearch*>(param);
-        search->info = info;
-        search->found = true;
-        return FALSE;
-    }
-    return TRUE;
-}
-
 } // namespace
 
 PauseWatcher::~PauseWatcher()
@@ -107,7 +88,7 @@ void CALLBACK PauseWatcher::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
         (event == EVENT_OBJECT_LOCATIONCHANGE && idObject == OBJID_WINDOW &&
          hwnd == GetForegroundWindow()))
     {
-        g_watcher->Evaluate();
+        g_watcher->dirty_ = true;
     }
 }
 
@@ -125,11 +106,17 @@ void PauseWatcher::ThreadMain()
                                     WINEVENT_OUTOFCONTEXT);
 
     Evaluate();
+    ULONGLONG lastEval = GetTickCount64();
 
     bool quit = false;
     while (!stop_.load(std::memory_order_relaxed) && !quit)
     {
-        MsgWaitForMultipleObjectsEx(0, nullptr, 500, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        // Wait only for the rest of the 500 ms poll interval; irrelevant events
+        // (cursor moves) wake us but must not force an Evaluate.
+        const ULONGLONG elapsed = GetTickCount64() - lastEval;
+        MsgWaitForMultipleObjectsEx(0, nullptr,
+                                    elapsed < 500 ? static_cast<DWORD>(500 - elapsed) : 0,
+                                    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 
         MSG message = {};
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
@@ -147,7 +134,12 @@ void PauseWatcher::ThreadMain()
         if (quit || stop_.load(std::memory_order_relaxed))
             break;
 
-        Evaluate();
+        if (dirty_ || GetTickCount64() - lastEval >= 500)
+        {
+            dirty_ = false;
+            Evaluate();
+            lastEval = GetTickCount64();
+        }
     }
 
     if (hookForeground_ != nullptr)
@@ -167,32 +159,42 @@ void PauseWatcher::ThreadMain()
 
 void PauseWatcher::Evaluate()
 {
+    LARGE_INTEGER evalStart = {};
+    QueryPerformanceCounter(&evalStart);
     bool nowPaused = false;
 
-    PrimaryMonitorSearch primary = {};
-    primary.info.cbSize = static_cast<DWORD>(sizeof(primary.info));
+    MONITORINFO monitorInfo = { sizeof(monitorInfo) };
 
-    EnumDisplayMonitors(nullptr, nullptr, EnumPrimaryMonitorProc,
-                        reinterpret_cast<LPARAM>(&primary));
-
-    if (primary.found)
+    if (GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY),
+                        &monitorInfo))
     {
-        const MONITORINFO& monitorInfo = primary.info;
         const DWORD ownProcess = GetCurrentProcessId();
+        const HWND shellWindow = GetShellWindow();
 
         for (HWND window = GetTopWindow(nullptr);
              window != nullptr;
              window = GetWindow(window, GW_HWNDNEXT))
         {
-            if (window == hostWindow_ || window == GetShellWindow())
-                continue;
-
-            DWORD processId = 0;
-            GetWindowThreadProcessId(window, &processId);
-            if (processId == ownProcess)
+            if (window == hostWindow_ || window == shellWindow)
                 continue;
 
             if (IsWindowVisible(window) == FALSE || IsIconic(window) != FALSE)
+                continue;
+
+            RECT windowRect = {};
+            if (GetWindowRect(window, &windowRect) == FALSE)
+                continue;
+            if (windowRect.right <= windowRect.left || windowRect.bottom <= windowRect.top)
+                continue;
+
+            if (!ContainsRect(windowRect, monitorInfo.rcWork) &&
+                !ContainsRect(windowRect, monitorInfo.rcMonitor))
+                continue;
+
+            // Expensive checks only for windows that actually cover the monitor.
+            DWORD processId = 0;
+            GetWindowThreadProcessId(window, &processId);
+            if (processId == ownProcess)
                 continue;
 
             wchar_t className[256] = {};
@@ -209,18 +211,8 @@ void PauseWatcher::Evaluate()
             if (SUCCEEDED(dwmResult) && cloaked != FALSE)
                 continue;
 
-            RECT windowRect = {};
-            if (GetWindowRect(window, &windowRect) == FALSE)
-                continue;
-            if (windowRect.right <= windowRect.left || windowRect.bottom <= windowRect.top)
-                continue;
-
-            if (ContainsRect(windowRect, monitorInfo.rcWork) ||
-                ContainsRect(windowRect, monitorInfo.rcMonitor))
-            {
-                nowPaused = true;
-                break;
-            }
+            nowPaused = true;
+            break;
         }
     }
 
@@ -230,4 +222,9 @@ void PauseWatcher::Evaluate()
         if (wakeEvent_ != nullptr)
             SetEvent(wakeEvent_);
     }
+
+    LARGE_INTEGER evalEnd = {};
+    QueryPerformanceCounter(&evalEnd);
+    evalCount_.fetch_add(1, std::memory_order_relaxed);
+    evalTicks_.fetch_add(evalEnd.QuadPart - evalStart.QuadPart, std::memory_order_relaxed);
 }

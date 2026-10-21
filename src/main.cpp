@@ -1,10 +1,18 @@
 #include <windows.h>
 #include <mfapi.h>
+#include <dxgi1_4.h>
+#include <psapi.h>
 
+#include <intrin.h>
+
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cwchar>
 #include <share.h>
 #include <string>
+#include <vector>
 
 #include "config.h"
 #include "video_decoder.h"
@@ -93,10 +101,91 @@ void WaitUntilQpc(LONGLONG target, HANDLE timer, LONGLONG frequency)
     }
 }
 
+// --bench <seconds>: play (ignoring the pause watcher) for a 2 second warmup
+// plus <seconds>, log one "bench:" summary line, then exit.
+struct BenchStats
+{
+    bool measuring = false;
+    LONGLONG start = 0;
+    LONGLONG lastPresent = 0;
+    LONGLONG decodeTicks = 0;
+    LONGLONG renderTicks = 0;
+    ULONG64 cyclesStart = 0;
+    unsigned long long tscStart = 0;
+    long long evalCountStart = 0;
+    long long evalTicksStart = 0;
+    std::vector<LONGLONG> intervals;
+};
+
+// GetProcessTimes is tick sampled and reads ~0 for short bursty work; cycle
+// time is exact and counts in TSC units, so cycles / TSC delta = cores busy.
+ULONG64 ProcessCycles()
+{
+    ULONG64 cycles = 0;
+    QueryProcessCycleTime(GetCurrentProcess(), &cycles);
+    return cycles;
+}
+
+void LogBench(const BenchStats& bench, LONGLONG now, LONGLONG frequency,
+              const PauseWatcher& watcher, ID3D11Device* device, double startupMs)
+{
+    const double seconds = static_cast<double>(now - bench.start) / frequency;
+    const double toMs = 1000.0 / frequency;
+    std::vector<LONGLONG> sorted = bench.intervals;
+    std::sort(sorted.begin(), sorted.end());
+    const size_t frames = sorted.size();
+    const LONGLONG median = frames ? sorted[frames / 2] : 0;
+    const LONGLONG p99 = frames ? sorted[(frames * 99) / 100] : 0;
+    const LONGLONG maximum = frames ? sorted.back() : 0;
+    const long long late = std::count_if(sorted.begin(), sorted.end(),
+                                         [&](LONGLONG v) { return v * 2 > median * 3; });
+
+    const double cpuPct = static_cast<double>(ProcessCycles() - bench.cyclesStart) /
+                          static_cast<double>(__rdtsc() - bench.tscStart) * 100.0;
+    const long long evals = watcher.evaluations() - bench.evalCountStart;
+    const long long evalTicks = watcher.evaluationTicks() - bench.evalTicksStart;
+
+    PROCESS_MEMORY_COUNTERS_EX memory = {};
+    GetProcessMemoryInfo(GetCurrentProcess(),
+                         reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, nonLocal = {};
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) &&
+        SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) && SUCCEEDED(adapter.As(&adapter3)))
+    {
+        adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
+        adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonLocal);
+        DXGI_ADAPTER_DESC desc = {};
+        adapter->GetDesc(&desc);
+        Log(L"bench adapter: %ls luid=0x%08lX", desc.Description, desc.AdapterLuid.LowPart);
+    }
+
+    const double mb = 1024.0 * 1024.0;
+    Log(L"bench: seconds=%.2f frames=%llu fps=%.2f median_ms=%.3f p99_ms=%.3f max_ms=%.3f "
+        L"late=%lld cpu_pct=%.2f decode_us=%.1f render_us=%.1f evals_per_s=%.1f eval_us=%.2f "
+        L"watcher_cpu_pct=%.3f ws_mb=%.1f private_mb=%.1f peak_ws_mb=%.1f "
+        L"gpu_local_mb=%.1f gpu_nonlocal_mb=%.1f startup_ms=%.1f",
+        seconds, static_cast<unsigned long long>(frames), frames / seconds,
+        median * toMs, p99 * toMs, maximum * toMs, late, cpuPct,
+        frames ? bench.decodeTicks * toMs * 1000.0 / frames : 0.0,
+        frames ? bench.renderTicks * toMs * 1000.0 / frames : 0.0,
+        evals / seconds, evals ? evalTicks * toMs * 1000.0 / evals : 0.0,
+        evalTicks * toMs / (seconds * 10.0),
+        memory.WorkingSetSize / mb, memory.PrivateUsage / mb, memory.PeakWorkingSetSize / mb,
+        local.CurrentUsage / mb, nonLocal.CurrentUsage / mb, startupMs);
+}
+
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
 {
+    const LONGLONG startQpc = QueryQpc();
+    const wchar_t* benchArg = commandLine ? std::wcsstr(commandLine, L"--bench") : nullptr;
+    const int benchSeconds = benchArg ? (std::max)(1, _wtoi(benchArg + 7)) : 0;
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, L"Local\\WallpaperSystemInstance");
@@ -187,6 +276,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     bool pacingValid = false;
     bool presentErrorLogged = false;
     LONGLONG pacingAnchor = 0;
+    BenchStats bench;
+    double startupMs = 0.0;
     DWORD lastFrameTick = GetTickCount();
     DWORD lastParentCheck = GetTickCount();
 
@@ -207,9 +298,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             break;
 
         if (renderer.CheckDisplayChanged())
+        {
+            // A view on the back buffer would make ResizeBuffers fail.
+            decoder.ReleaseOutputTarget();
             renderer.HandleDisplayChange();
+        }
 
-        if (watcher.IsPaused())
+        if (watcher.IsPaused() && benchSeconds == 0)
         {
             if (!paused)
             {
@@ -230,8 +325,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             Log(L"resumed");
         }
 
+        const LONGLONG decodeStart = QueryQpc();
         DecodedFrame frame = {};
         const DecodeResult result = decoder.DecodeNext(frame);
+        const LONGLONG decodeTicks = QueryQpc() - decodeStart;
         if (result == DecodeResult::Frame)
         {
             LONGLONG pts = decoder.timestamp();
@@ -256,10 +353,42 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
                 WaitUntilQpc(target, frameTimer, qpcFrequency);
 
             renderer.WaitForFrameLatency();
-            const HRESULT presentResult = renderer.RenderFrame(frame.srv, frame.srvUV,
-                                                                decoder.width(), decoder.height(),
-                                                                frame.planarUV);
-            lastFrameTick = GetTickCount();
+            const LONGLONG renderStart = QueryQpc();
+            HRESULT presentResult = frame.hardware
+                ? decoder.BlitTo(renderer.backBuffer(), renderer.width(), renderer.height())
+                : renderer.RenderFrame(frame.srv, frame.srvUV, decoder.width(), decoder.height());
+            if (SUCCEEDED(presentResult))
+                presentResult = renderer.Present();
+            const LONGLONG presented = QueryQpc();
+            if (SUCCEEDED(presentResult))
+                lastFrameTick = GetTickCount();  // Persistent failures trip the 5 s watchdog.
+
+            if (benchSeconds > 0 && firstFrame)
+            {
+                if (bench.measuring)
+                {
+                    bench.intervals.push_back(presented - bench.lastPresent);
+                    bench.decodeTicks += decodeTicks;
+                    bench.renderTicks += presented - renderStart;
+                    if (presented - bench.start >= benchSeconds * qpcFrequency)
+                    {
+                        LogBench(bench, presented, qpcFrequency, watcher, renderer.device(),
+                                 startupMs);
+                        break;
+                    }
+                }
+                else if (presented >= bench.start)
+                {
+                    bench.measuring = true;
+                    bench.start = presented;
+                    bench.cyclesStart = ProcessCycles();
+                    bench.tscStart = __rdtsc();
+                    bench.evalCountStart = watcher.evaluations();
+                    bench.evalTicksStart = watcher.evaluationTicks();
+                    bench.intervals.reserve(static_cast<size_t>(benchSeconds) * 240);
+                }
+                bench.lastPresent = presented;
+            }
 
             if (FAILED(presentResult))
             {
@@ -279,7 +408,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             if (!firstFrame)
             {
                 firstFrame = true;
-                Log(L"first frame presented");
+                startupMs = static_cast<double>(presented - startQpc) * 1000.0 / qpcFrequency;
+                bench.start = presented + 2 * qpcFrequency;
+                Log(L"first frame presented (%.1f ms after start)", startupMs);
             }
         }
         else if (result == DecodeResult::EndOfStream)

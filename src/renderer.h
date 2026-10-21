@@ -28,10 +28,15 @@ public:
     HWND window() const { return hwnd_; }
     HWND workerWindow() const { return workerW_; }
     ID3D11Device* device() const { return device_.Get(); }
+    ID3D11Texture2D* backBuffer() const { return backBuffer_.Get(); }
+    int width() const { return bufferWidth_; }
+    int height() const { return bufferHeight_; }
 
     void WaitForFrameLatency();
+    // Draws an NV12 software frame (luma + chroma views) into the back buffer.
     HRESULT RenderFrame(ID3D11ShaderResourceView* srv, ID3D11ShaderResourceView* srvUV,
-                        int videoWidth, int videoHeight, bool planarUV);
+                        int videoWidth, int videoHeight);
+    HRESULT Present() { return swapChain_->Present(1, 0); }
 
     bool CheckDisplayChanged();
     bool HandleDisplayChange();
@@ -43,7 +48,7 @@ private:
     bool CreateDevice();
     bool CreateSwapChain(int width, int height);
     bool CreateBackBufferView();
-    bool CompileShaders();
+    bool CreateShaders();
     bool AttachToDesktop();
     void UpdateSizeFromMonitor();
     void ReleaseBackBuffer();
@@ -66,6 +71,7 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGISwapChain1> swapChain_;
+    ComPtr<ID3D11Texture2D> backBuffer_;
     ComPtr<ID3D11RenderTargetView> rtv_;
     ComPtr<ID3D11VertexShader> vs_;
     ComPtr<ID3D11PixelShader> ps_;

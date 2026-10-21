@@ -22,6 +22,9 @@ target_compile_definitions(WallpaperSystem PRIVATE
 
 if(MSVC)
     target_compile_options(WallpaperSystem PRIVATE /utf-8 /W4 /permissive-)
+    # Only the software fallback compiles shaders; keep the DLL off the hardware path.
+    target_link_options(WallpaperSystem PRIVATE /DELAYLOAD:d3dcompiler_47.dll)
+    target_link_libraries(WallpaperSystem PRIVATE delayimp)
     set_property(TARGET WallpaperSystem PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()

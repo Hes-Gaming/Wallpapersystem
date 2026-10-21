@@ -1,5 +1,8 @@
 #include "renderer.h"
 
+#include <winternl.h>
+#include <d3dkmthk.h>
+#include <dxgi1_4.h>
 #include <d3d10.h>
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -16,8 +19,6 @@ cbuffer FrameParams : register(b0)
 {
     float2 uvScale;
     float2 uvOffset;
-    float  isPlanar;
-    float3 padding;
 };
 
 Texture2D    frameTex  : register(t0);
@@ -42,10 +43,6 @@ VSOut VSMain(uint vertexId : SV_VertexID)
 float4 PSMain(VSOut i) : SV_Target
 {
     float2 uv = i.uv * uvScale + uvOffset;
-
-    if (isPlanar <= 0.5)
-        return float4(frameTex.Sample(frameSampler, uv).rgb, 1.0);
-
     float luma = frameTex.Sample(frameSampler, uv).r;
     float2 chroma = chromaTex.Sample(frameSampler, uv).rg;
     float3 yuv = float3(luma, chroma.x, chroma.y);
@@ -67,11 +64,9 @@ struct FrameConstants
 {
     float uvScale[2];
     float uvOffset[2];
-    float isPlanar;
-    float padding[3];
 };
 
-static_assert(sizeof(FrameConstants) == 32, "constant buffer must remain 16-byte aligned");
+static_assert(sizeof(FrameConstants) == 16, "constant buffer must remain 16-byte aligned");
 
 BOOL CALLBACK EnumIconHostProc(HWND hwnd, LPARAM param)
 {
@@ -105,23 +100,49 @@ BOOL CALLBACK EnumFullscreenWorkerProc(HWND hwnd, LPARAM param)
     return FALSE;
 }
 
-BOOL CALLBACK EnumPrimaryMonitorProc(HMONITOR monitor, HDC, LPRECT, LPARAM param)
+HMONITOR PrimaryMonitor()
 {
-    MONITORINFO info = { sizeof(info) };
-    if (GetMonitorInfoW(monitor, &info) && (info.dwFlags & MONITORINFOF_PRIMARY) != 0)
-    {
-        *reinterpret_cast<RECT*>(param) = info.rcMonitor;
-        return FALSE;
-    }
-    return TRUE;
+    return MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
 }
 
 RECT PrimaryMonitorRect()
 {
     RECT rect = { 0, 0, 1920, 1080 };
-    EnumDisplayMonitors(nullptr, nullptr, EnumPrimaryMonitorProc,
-                        reinterpret_cast<LPARAM>(&rect));
+    MONITORINFO info = { sizeof(info) };
+    if (GetMonitorInfoW(PrimaryMonitor(), &info))
+        rect = info.rcMonitor;
     return rect;
+}
+
+// The adapter driving the primary monitor, so decode + render + scanout share one GPU.
+// The adapter that physically scans out the primary monitor. On hybrid laptops
+// DXGI reports the panel's outputs on whichever GPU the process runs on, so ask
+// the kernel which adapter really owns the display.
+ComPtr<IDXGIAdapter1> FindPrimaryMonitorAdapter()
+{
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(PrimaryMonitor(), &info))
+        return nullptr;
+
+    D3DKMT_OPENADAPTERFROMHDC open = {};
+    open.hDc = CreateDCW(info.szDevice, nullptr, nullptr, nullptr);
+    if (!open.hDc)
+        return nullptr;
+    const NTSTATUS status = D3DKMTOpenAdapterFromHdc(&open);
+    DeleteDC(open.hDc);
+    if (status < 0)
+        return nullptr;
+    D3DKMT_CLOSEADAPTER close = {};
+    close.hAdapter = open.hAdapter;
+    D3DKMTCloseAdapter(&close);
+
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumAdapterByLuid(open.AdapterLuid, IID_PPV_ARGS(&adapter))))
+        return nullptr;
+    return adapter;
 }
 
 // After sending 0x052C to Progman, Explorer creates a fresh top-level WorkerW
@@ -215,38 +236,6 @@ bool Renderer::Create(HINSTANCE instance)
         failureCode_ = GetLastError();
         return false;
     }
-    if (!CompileShaders())
-    {
-        failureStage_ = 6;
-        failureCode_ = GetLastError();
-        return false;
-    }
-
-    D3D11_SAMPLER_DESC samplerDesc = {};
-    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
-    if (FAILED(device_->CreateSamplerState(&samplerDesc, &sampler_)))
-    {
-        failureStage_ = 7;
-        failureCode_ = GetLastError();
-        return false;
-    }
-
-    D3D11_BUFFER_DESC bufferDesc = {};
-    bufferDesc.ByteWidth = sizeof(FrameConstants);
-    bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
-    bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    if (FAILED(device_->CreateBuffer(&bufferDesc, nullptr, &cb_)))
-    {
-        failureStage_ = 8;
-        failureCode_ = GetLastError();
-        return false;
-    }
 
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd_);
@@ -279,12 +268,13 @@ void Renderer::Destroy()
 
 void Renderer::ReleaseBackBuffer()
 {
+    rtv_.Reset();
+    backBuffer_.Reset();
     if (context_)
     {
         context_->OMSetRenderTargets(0, nullptr, nullptr);
         context_->Flush();
     }
-    rtv_.Reset();
 }
 
 void Renderer::UpdateSizeFromMonitor()
@@ -362,16 +352,27 @@ bool Renderer::CreateDevice()
     const UINT plainFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     D3D_FEATURE_LEVEL obtained = D3D_FEATURE_LEVEL_11_0;
 
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, videoFlags,
-                                   levels, _countof(levels), D3D11_SDK_VERSION,
-                                   &device_, &obtained, &context_);
-    videoSupport_ = SUCCEEDED(hr);
-    if (FAILED(hr))
+    // A null adapter means the system default.
+    auto create = [&](IDXGIAdapter* adapter)
     {
-        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, plainFlags,
-                               levels, _countof(levels), D3D11_SDK_VERSION,
-                               &device_, &obtained, &context_);
-    }
+        const D3D_DRIVER_TYPE type = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+        HRESULT result = D3D11CreateDevice(adapter, type, nullptr, videoFlags,
+                                           levels, _countof(levels), D3D11_SDK_VERSION,
+                                           &device_, &obtained, &context_);
+        videoSupport_ = SUCCEEDED(result);
+        if (FAILED(result))
+        {
+            result = D3D11CreateDevice(adapter, type, nullptr, plainFlags,
+                                       levels, _countof(levels), D3D11_SDK_VERSION,
+                                       &device_, &obtained, &context_);
+        }
+        return result;
+    };
+
+    const ComPtr<IDXGIAdapter1> adapter = FindPrimaryMonitorAdapter();
+    HRESULT hr = adapter ? create(adapter.Get()) : E_FAIL;
+    if (FAILED(hr) || !videoSupport_)
+        hr = create(nullptr);  // Prefer a default adapter that can decode video.
     if (FAILED(hr))
     {
         failureCode_ = static_cast<DWORD>(hr);
@@ -446,16 +447,37 @@ bool Renderer::CreateSwapChain(int width, int height)
 
 bool Renderer::CreateBackBufferView()
 {
-    ComPtr<ID3D11Texture2D> backBuffer;
-    if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer))))
+    // Flip model: buffer 0 always refers to the current back buffer, so the
+    // texture and views on it stay valid across Present calls.
+    if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer_))))
         return false;
-    if (FAILED(device_->CreateRenderTargetView(backBuffer.Get(), nullptr, &rtv_)))
+    if (FAILED(device_->CreateRenderTargetView(backBuffer_.Get(), nullptr, &rtv_)))
         return false;
     return true;
 }
 
-bool Renderer::CompileShaders()
+// Software frames only, so the hardware path never loads d3dcompiler_47.dll
+// (delay loaded). ps_ is created last: non-null means everything is ready.
+bool Renderer::CreateShaders()
 {
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(device_->CreateSamplerState(&samplerDesc, &sampler_)))
+        return false;
+
+    D3D11_BUFFER_DESC bufferDesc = {};
+    bufferDesc.ByteWidth = sizeof(FrameConstants);
+    bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+    bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(device_->CreateBuffer(&bufferDesc, nullptr, &cb_)))
+        return false;
+
     UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_STRICTNESS;
     const size_t sourceLength = std::strlen(kShaderSource);
 
@@ -498,10 +520,17 @@ void Renderer::WaitForFrameLatency()
 }
 
 HRESULT Renderer::RenderFrame(ID3D11ShaderResourceView* srv, ID3D11ShaderResourceView* srvUV,
-                              int videoWidth, int videoHeight, bool planarUV)
+                              int videoWidth, int videoHeight)
 {
-    if (!srv || !rtv_ || !swapChain_ || !context_)
+    if (!srv || !srvUV || !rtv_ || !context_)
         return E_FAIL;
+
+    // failureStage_ stops a failed shader setup from being retried every frame.
+    if (!ps_ && (failureStage_ != 0 || !CreateShaders()))
+    {
+        failureStage_ = 6;
+        return E_FAIL;
+    }
 
     FrameConstants constants = {};
     const float srcWidth = static_cast<float>(videoWidth);
@@ -525,7 +554,6 @@ HRESULT Renderer::RenderFrame(ID3D11ShaderResourceView* srv, ID3D11ShaderResourc
         constants.uvScale[0] = 1.0f;
         constants.uvScale[1] = 1.0f;
     }
-    constants.isPlanar = planarUV ? 1.0f : 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context_->Map(cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -554,8 +582,7 @@ HRESULT Renderer::RenderFrame(ID3D11ShaderResourceView* srv, ID3D11ShaderResourc
     context_->PSSetConstantBuffers(0, 1, &constantBuffer);
     context_->PSSetSamplers(0, 1, &sampler);
     context_->Draw(3, 0);
-
-    return swapChain_->Present(1, 0);
+    return S_OK;
 }
 
 bool Renderer::HandleDisplayChange()

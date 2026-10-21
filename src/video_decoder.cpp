@@ -10,9 +10,11 @@ VideoDecoder::~VideoDecoder()
 
 void VideoDecoder::Close()
 {
-    outputView_.Reset();
-    bgraView_.Reset();
-    bgraTexture_.Reset();
+    ReleaseOutputTarget();
+    currentInput_ = nullptr;
+    inputViews_.clear();
+    inputTexture_.Reset();
+    currentSample_.Reset();
     vp_.Reset();
     vpEnumerator_.Reset();
     videoContext_.Reset();
@@ -96,9 +98,11 @@ bool VideoDecoder::OpenHardware()
 bool VideoDecoder::OpenSoftware()
 {
     reader_.Reset();
-    outputView_.Reset();
-    bgraView_.Reset();
-    bgraTexture_.Reset();
+    ReleaseOutputTarget();
+    currentInput_ = nullptr;
+    inputViews_.clear();
+    inputTexture_.Reset();
+    currentSample_.Reset();
     vp_.Reset();
     vpEnumerator_.Reset();
     videoContext_.Reset();
@@ -166,61 +170,62 @@ bool VideoDecoder::CreateReaderSoftware(const std::wstring& url)
 
 bool VideoDecoder::NegotiateOutputType(const GUID& subtype)
 {
-    ComPtr<IMFMediaType> nativeType;
-    HRESULT hr = reader_->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &nativeType);
-    if (FAILED(hr))
-    {
-        hwCode_ = hr;
-        return false;
-    }
-
-    UINT32 width = 0;
-    UINT32 height = 0;
-    hr = MFGetAttributeSize(nativeType.Get(), MF_MT_FRAME_SIZE, &width, &height);
-    if (FAILED(hr) || width == 0 || height == 0)
-    {
-        hwCode_ = hr;
-        return false;
-    }
-
-    width_ = static_cast<int>(width);
-    height_ = static_cast<int>(height);
-
     ComPtr<IMFMediaType> outputType;
-    hr = MFCreateMediaType(&outputType);
+    HRESULT hr = MFCreateMediaType(&outputType);
     if (FAILED(hr))
     {
         hwCode_ = hr;
         return false;
     }
 
+    // Only the subtype: any other attribute that differs from the decoder's
+    // native output makes the reader insert its own video processor.
     outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     outputType->SetGUID(MF_MT_SUBTYPE, subtype);
-    MFSetAttributeSize(outputType.Get(), MF_MT_FRAME_SIZE, width, height);
-    outputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeRatio(outputType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    UINT32 frameRateNumerator = 0;
-    UINT32 frameRateDenominator = 0;
-    if (SUCCEEDED(MFGetAttributeRatio(nativeType.Get(), MF_MT_FRAME_RATE,
-                                      &frameRateNumerator, &frameRateDenominator)) &&
-        frameRateDenominator != 0)
-    {
-        MFSetAttributeRatio(outputType.Get(), MF_MT_FRAME_RATE,
-                            frameRateNumerator, frameRateDenominator);
-    }
-
-    UINT32 nativeAttribute = 0;
-    if (SUCCEEDED(nativeType->GetUINT32(MF_MT_YUV_MATRIX, &nativeAttribute)))
-        outputType->SetUINT32(MF_MT_YUV_MATRIX, nativeAttribute);
-    if (SUCCEEDED(nativeType->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &nativeAttribute)))
-        outputType->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, nativeAttribute);
 
     hr = reader_->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, outputType.Get());
     if (FAILED(hr))
     {
         hwCode_ = hr;
         return false;
+    }
+
+    return ReadOutputType();
+}
+
+bool VideoDecoder::ReadOutputType()
+{
+    ComPtr<IMFMediaType> type;
+    HRESULT hr = reader_->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &type);
+    UINT32 codedWidth = 0;
+    UINT32 codedHeight = 0;
+    if (SUCCEEDED(hr))
+        hr = MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &codedWidth, &codedHeight);
+    if (FAILED(hr) || codedWidth == 0 || codedHeight == 0)
+    {
+        hwCode_ = hr;
+        return false;
+    }
+
+    MFVideoArea area = {};
+    UINT8* blob = reinterpret_cast<UINT8*>(&area);
+    const UINT32 blobSize = static_cast<UINT32>(sizeof(area));
+    if (FAILED(type->GetBlob(MF_MT_MINIMUM_DISPLAY_APERTURE, blob, blobSize, nullptr)))
+        type->GetBlob(MF_MT_GEOMETRIC_APERTURE, blob, blobSize, nullptr);
+
+    codedWidth_ = static_cast<int>(codedWidth);
+    codedHeight_ = static_cast<int>(codedHeight);
+    apertureX_ = area.OffsetX.value;
+    apertureY_ = area.OffsetY.value;
+    width_ = static_cast<int>(area.Area.cx);
+    height_ = static_cast<int>(area.Area.cy);
+    if (apertureX_ < 0 || apertureY_ < 0 || width_ <= 0 || height_ <= 0 ||
+        width_ > codedWidth_ - apertureX_ || height_ > codedHeight_ - apertureY_)
+    {
+        apertureX_ = 0;
+        apertureY_ = 0;
+        width_ = codedWidth_;
+        height_ = codedHeight_;
     }
 
     return true;
@@ -246,8 +251,8 @@ bool VideoDecoder::PrepareHardwareResources()
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     content.InputFrameRate.Numerator = 60;
     content.InputFrameRate.Denominator = 1;
-    content.InputWidth = static_cast<UINT>(width_);
-    content.InputHeight = static_cast<UINT>(height_);
+    content.InputWidth = static_cast<UINT>(codedWidth_);
+    content.InputHeight = static_cast<UINT>(codedHeight_);
     content.OutputFrameRate = content.InputFrameRate;
     content.OutputWidth = static_cast<UINT>(width_);
     content.OutputHeight = static_cast<UINT>(height_);
@@ -269,49 +274,8 @@ bool VideoDecoder::PrepareHardwareResources()
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = static_cast<UINT>(width_);
-    desc.Height = static_cast<UINT>(height_);
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-    hwStage_ = 5;
-    hr = device_->CreateTexture2D(&desc, nullptr, &bgraTexture_);
-    if (FAILED(hr))
-    {
-        hwCode_ = hr;
-        return false;
-    }
-
-    hwStage_ = 6;
-    hr = device_->CreateShaderResourceView(bgraTexture_.Get(), nullptr, &bgraView_);
-    if (FAILED(hr))
-    {
-        hwCode_ = hr;
-        return false;
-    }
-
-    hwStage_ = 10;
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputDesc = {};
-    outputDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    outputDesc.Texture2D.MipSlice = 0;
-    hr = videoDevice_->CreateVideoProcessorOutputView(bgraTexture_.Get(),
-                                                      vpEnumerator_.Get(),
-                                                      &outputDesc, &outputView_);
-    if (FAILED(hr))
-    {
-        hwCode_ = hr;
-        return false;
-    }
-
-    const RECT sourceRect = { 0, 0, width_, height_ };
-    const RECT destRect = { 0, 0, width_, height_ };
-    videoContext_->VideoProcessorSetStreamSourceRect(vp_.Get(), 0, TRUE, &sourceRect);
-    videoContext_->VideoProcessorSetStreamDestRect(vp_.Get(), 0, TRUE, &destRect);
+    // No driver "enhancement" passes (denoise, edge enhancement, ...).
+    videoContext_->VideoProcessorSetStreamAutoProcessingMode(vp_.Get(), 0, FALSE);
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColor = {};
     inputColor.YCbCr_Matrix = 1;  // BT.709
@@ -360,33 +324,50 @@ bool VideoDecoder::PrepareSoftwareResources()
 DecodeResult VideoDecoder::DecodeNext(DecodedFrame& frame)
 {
     frame = {};
+    currentInput_ = nullptr;
     if (!reader_)
         return DecodeResult::EndOfStream;
 
     DWORD flags = 0;
     LONGLONG timestamp = 0;
-    IMFSample* sample = nullptr;
 
+    // Replaces (releases) the previous frame, whose blit is already submitted.
     HRESULT hr = reader_->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, nullptr,
-                                     &flags, &timestamp, &sample);
+                                     &flags, &timestamp, &currentSample_);
     if (FAILED(hr))
         return DecodeResult::Retry;
 
     if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
-    {
-        if (sample)
-            sample->Release();
         return DecodeResult::EndOfStream;
-    }
 
-    if (!sample)
+    if (!currentSample_)
         return DecodeResult::Retry;
+
+    if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)
+    {
+        if (!ReadOutputType())
+            return DecodeResult::Retry;
+        if (hardware_)
+        {
+            // The video processor and its views are sized for the old type.
+            inputViews_.clear();
+            inputTexture_.Reset();
+            ReleaseOutputTarget();
+            if (!PrepareHardwareResources())
+            {
+                OpenSoftware();
+                return DecodeResult::Retry;
+            }
+        }
+        else if (!PrepareSoftwareResources())
+        {
+            return DecodeResult::Retry;
+        }
+    }
 
     if (hardware_)
     {
-        bool decoded = DecodeHardware(sample, frame);
-        sample->Release();
-        if (decoded)
+        if (DecodeHardware(currentSample_.Get(), frame))
         {
             timestamp_ = timestamp;
             return DecodeResult::Frame;
@@ -394,14 +375,11 @@ DecodeResult VideoDecoder::DecodeNext(DecodedFrame& frame)
 
         // The hardware reader handed back a frame we cannot consume on the
         // GPU. Reopen once in software mode.
-        if (OpenSoftware())
-            return DecodeResult::Retry;
+        OpenSoftware();
         return DecodeResult::Retry;
     }
 
-    bool decoded = DecodeSoftware(sample, frame);
-    sample->Release();
-    if (decoded)
+    if (DecodeSoftware(currentSample_.Get(), frame))
     {
         timestamp_ = timestamp;
         return DecodeResult::Frame;
@@ -427,37 +405,91 @@ bool VideoDecoder::DecodeHardware(IMFSample* sample, DecodedFrame& frame)
     if (FAILED(dxgiBuffer->GetSubresourceIndex(&subresource)))
         return false;
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputDesc = {};
-    inputDesc.FourCC = 0;
-    inputDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    inputDesc.Texture2D.MipSlice = 0;
-    inputDesc.Texture2D.ArraySlice = subresource;
-
-    ComPtr<ID3D11VideoProcessorInputView> inputView;
-    HRESULT hr = videoDevice_->CreateVideoProcessorInputView(sourceTexture.Get(),
-                                                              vpEnumerator_.Get(),
-                                                              &inputDesc, &inputView);
-    if (FAILED(hr))
+    // The decoder cycles through the slices of one texture array, so the
+    // input views are created once per slice.
+    if (sourceTexture.Get() != inputTexture_.Get())
     {
-        hwCode_ = hr;
-        return false;
+        inputViews_.clear();
+        inputTexture_ = sourceTexture;
+    }
+    if (subresource >= inputViews_.size())
+        inputViews_.resize(subresource + 1);
+
+    ComPtr<ID3D11VideoProcessorInputView>& inputView = inputViews_[subresource];
+    if (!inputView)
+    {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputDesc = {};
+        inputDesc.FourCC = 0;
+        inputDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        inputDesc.Texture2D.MipSlice = 0;
+        inputDesc.Texture2D.ArraySlice = subresource;
+
+        const HRESULT hr = videoDevice_->CreateVideoProcessorInputView(sourceTexture.Get(),
+                                                                        vpEnumerator_.Get(),
+                                                                        &inputDesc, &inputView);
+        if (FAILED(hr))
+        {
+            hwCode_ = hr;
+            return false;
+        }
     }
 
-    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
-    stream.Enable = TRUE;
-    stream.pInputSurface = inputView.Get();
-
-    hr = videoContext_->VideoProcessorBlt(vp_.Get(), outputView_.Get(), 0, 1, &stream);
-    if (FAILED(hr))
-    {
-        hwCode_ = hr;
-        return false;
-    }
-
-    frame.srv = bgraView_.Get();
-    frame.srvUV = nullptr;
-    frame.planarUV = false;
+    currentInput_ = inputView.Get();
+    frame.hardware = true;
     return true;
+}
+
+HRESULT VideoDecoder::BlitTo(ID3D11Texture2D* target, int targetWidth, int targetHeight)
+{
+    if (!hardware_ || !currentInput_ || !target || targetWidth <= 0 || targetHeight <= 0)
+        return E_FAIL;
+
+    HRESULT hr = S_OK;
+    if (target != outputTarget_)
+    {
+        ReleaseOutputTarget();
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputDesc = {};
+        outputDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        outputDesc.Texture2D.MipSlice = 0;
+        hr = videoDevice_->CreateVideoProcessorOutputView(target, vpEnumerator_.Get(),
+                                                          &outputDesc, &outputView_);
+        if (SUCCEEDED(hr))
+            outputTarget_ = target;
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        // Cover: fill the target and center-crop the excess of the visible region.
+        const double scale = (std::max)(static_cast<double>(targetWidth) / width_,
+                                        static_cast<double>(targetHeight) / height_);
+        const LONG cropWidth = static_cast<LONG>(targetWidth / scale + 0.5);
+        const LONG cropHeight = static_cast<LONG>(targetHeight / scale + 0.5);
+        const LONG left = apertureX_ + (width_ - cropWidth) / 2;
+        const LONG top = apertureY_ + (height_ - cropHeight) / 2;
+        const RECT sourceRect = { left, top, left + cropWidth, top + cropHeight };
+        const RECT destRect = { 0, 0, targetWidth, targetHeight };
+        videoContext_->VideoProcessorSetStreamSourceRect(vp_.Get(), 0, TRUE, &sourceRect);
+        videoContext_->VideoProcessorSetStreamDestRect(vp_.Get(), 0, TRUE, &destRect);
+
+        D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+        stream.Enable = TRUE;
+        stream.pInputSurface = currentInput_;
+        hr = videoContext_->VideoProcessorBlt(vp_.Get(), outputView_.Get(), 0, 1, &stream);
+    }
+
+    if (FAILED(hr))
+    {
+        // The GPU cannot process this frame. Reopen once in software mode.
+        hwCode_ = hr;
+        OpenSoftware();
+    }
+    return hr;
+}
+
+void VideoDecoder::ReleaseOutputTarget()
+{
+    outputView_.Reset();
+    outputTarget_ = nullptr;
 }
 
 bool VideoDecoder::DecodeSoftware(IMFSample* sample, DecodedFrame& frame)
@@ -466,76 +498,56 @@ bool VideoDecoder::DecodeSoftware(IMFSample* sample, DecodedFrame& frame)
     if (FAILED(sample->GetBufferByIndex(0, &buffer)))
         return false;
 
-    const BYTE* data = nullptr;
-    int pitch = 0;
-    bool locked2d = false;
-    bool locked1d = false;
-    DWORD bufferLength = 0;
-    buffer->GetCurrentLength(&bufferLength);
+    BYTE* data = nullptr;
+    LONG pitch = 0;
+    DWORD length = 0;
+    bool uploaded = false;
 
-    ComPtr<IMF2DBuffer> buffer2d;
-    BYTE* raw = nullptr;
-    LONG stride = 0;
-
-    if (SUCCEEDED(buffer.As(&buffer2d)) && SUCCEEDED(buffer2d->Lock2D(&raw, &stride)))
+    // Lock2DSize reports the real locked length; GetCurrentLength would be
+    // the contiguous (unpadded) size.
+    ComPtr<IMF2DBuffer2> buffer2d;
+    BYTE* bufferStart = nullptr;
+    if (SUCCEEDED(buffer.As(&buffer2d)) &&
+        SUCCEEDED(buffer2d->Lock2DSize(MF2DBuffer_LockFlags_Read, &data, &pitch, &bufferStart, &length)))
     {
-        if (!raw || stride < width_)
-        {
-            buffer2d->Unlock2D();
-            return false;
-        }
-        locked2d = true;
-        data = raw;
-        pitch = static_cast<int>(stride);
+        uploaded = UploadSoftwareFrame(data, pitch, length - static_cast<DWORD>(data - bufferStart));
+        buffer2d->Unlock2D();
     }
     else
     {
         DWORD maxLength = 0;
-        DWORD currentLength = 0;
-        if (FAILED(buffer->Lock(&raw, &maxLength, &currentLength)) || !raw)
+        if (FAILED(buffer->Lock(&data, &maxLength, &length)))
             return false;
-        locked1d = true;
-        data = raw;
-        pitch = width_;
-        if (bufferLength == 0)
-            bufferLength = currentLength;
-    }
-
-    const bool uploaded = UploadSoftwareFrame(data, pitch, bufferLength);
-
-    if (locked2d)
-        buffer2d->Unlock2D();
-    if (locked1d)
+        uploaded = UploadSoftwareFrame(data, codedWidth_, length);
         buffer->Unlock();
+    }
 
     if (!uploaded)
         return false;
 
     frame.srv = yView_.Get();
     frame.srvUV = uvView_.Get();
-    frame.planarUV = true;
     return true;
 }
 
-bool VideoDecoder::UploadSoftwareFrame(const BYTE* data, int pitch, DWORD bufferLength)
+bool VideoDecoder::UploadSoftwareFrame(const BYTE* data, LONG pitch, DWORD bufferLength)
 {
-    if (!data || pitch < width_)
+    if (!data || pitch < codedWidth_)
         return false;
 
+    const size_t stride = static_cast<size_t>(pitch);
     const int chromaWidth = (width_ + 1) / 2;
     const int chromaHeight = (height_ + 1) / 2;
 
-    int planeHeight = height_;
-    if (bufferLength > 0)
-    {
-        const size_t estimate =
-            static_cast<size_t>(bufferLength) * 2 / (3 * static_cast<size_t>(pitch));
-        if (estimate >= static_cast<size_t>(height_) &&
-            estimate <= static_cast<size_t>(height_) + 64)
-        {
-            planeHeight = static_cast<int>(estimate);
-        }
-    }
+    // NV12: the chroma plane follows codedHeight luma rows. Copy only the
+    // visible region, and never read past the end of the buffer.
+    const BYTE* luma = data + stride * apertureY_ + apertureX_;
+    const size_t chromaOffset = stride * (codedHeight_ + apertureY_ / 2) + (apertureX_ & ~1);
+    const size_t chromaEnd = chromaOffset + stride * (chromaHeight - 1) +
+                             static_cast<size_t>(chromaWidth) * 2;
+    if (chromaEnd > bufferLength)
+        return false;
+    const BYTE* chroma = data + chromaOffset;
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context_->Map(yTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -544,19 +556,18 @@ bool VideoDecoder::UploadSoftwareFrame(const BYTE* data, int pitch, DWORD buffer
     for (int y = 0; y < height_; ++y)
     {
         std::memcpy(static_cast<BYTE*>(mapped.pData) + static_cast<size_t>(mapped.RowPitch) * y,
-                    data + static_cast<size_t>(pitch) * y,
+                    luma + stride * y,
                     static_cast<size_t>(width_));
     }
     context_->Unmap(yTexture_.Get(), 0);
 
-    const BYTE* chromaPlane = data + static_cast<size_t>(pitch) * static_cast<size_t>(planeHeight);
     if (FAILED(context_->Map(uvTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
         return false;
 
     for (int y = 0; y < chromaHeight; ++y)
     {
         std::memcpy(static_cast<BYTE*>(mapped.pData) + static_cast<size_t>(mapped.RowPitch) * y,
-                    chromaPlane + static_cast<size_t>(pitch) * y,
+                    chroma + stride * y,
                     static_cast<size_t>(chromaWidth) * 2);
     }
     context_->Unmap(uvTexture_.Get(), 0);

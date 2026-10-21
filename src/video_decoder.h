@@ -7,15 +7,16 @@
 #include <mfobjects.h>
 #include <mfreadwrite.h>
 #include <string>
+#include <vector>
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
 
 struct DecodedFrame
 {
-    ID3D11ShaderResourceView* srv = nullptr;    // BGRA view, or luma for the software path.
-    ID3D11ShaderResourceView* srvUV = nullptr;  // Chroma view, software path only.
-    bool planarUV = false;
+    bool hardware = false;                      // On the GPU: draw it with VideoDecoder::BlitTo.
+    ID3D11ShaderResourceView* srv = nullptr;    // Luma, software path only.
+    ID3D11ShaderResourceView* srvUV = nullptr;  // Chroma, software path only.
 };
 
 enum class DecodeResult
@@ -42,6 +43,10 @@ public:
     DecodeResult DecodeNext(DecodedFrame& frame);
     bool Rewind();
 
+    // Hardware frames: scales the current frame (cover crop) into target.
+    HRESULT BlitTo(ID3D11Texture2D* target, int targetWidth, int targetHeight);
+    void ReleaseOutputTarget();
+
     bool hardware() const { return hardware_; }
     int width() const { return width_; }
     int height() const { return height_; }
@@ -55,9 +60,10 @@ private:
     bool CreateReaderHardware(const std::wstring& url);
     bool CreateReaderSoftware(const std::wstring& url);
     bool NegotiateOutputType(const GUID& subtype);
+    bool ReadOutputType();
     bool PrepareHardwareResources();
     bool PrepareSoftwareResources();
-    bool UploadSoftwareFrame(const BYTE* data, int pitch, DWORD bufferLength);
+    bool UploadSoftwareFrame(const BYTE* data, LONG pitch, DWORD bufferLength);
     bool DecodeHardware(IMFSample* sample, DecodedFrame& frame);
     bool DecodeSoftware(IMFSample* sample, DecodedFrame& frame);
 
@@ -69,17 +75,24 @@ private:
     ComPtr<ID3D11VideoContext> videoContext_;
     ComPtr<ID3D11VideoProcessorEnumerator> vpEnumerator_;
     ComPtr<ID3D11VideoProcessor> vp_;
-    ComPtr<ID3D11Texture2D> bgraTexture_;
-    ComPtr<ID3D11ShaderResourceView> bgraView_;
+    ComPtr<IMFSample> currentSample_;  // Keeps the decoder surface alive until the blit.
+    ComPtr<ID3D11Texture2D> inputTexture_;
+    std::vector<ComPtr<ID3D11VideoProcessorInputView>> inputViews_;  // Per subresource of inputTexture_.
+    ID3D11VideoProcessorInputView* currentInput_ = nullptr;
     ComPtr<ID3D11VideoProcessorOutputView> outputView_;
+    ID3D11Texture2D* outputTarget_ = nullptr;
     ComPtr<ID3D11Texture2D> yTexture_;
     ComPtr<ID3D11ShaderResourceView> yView_;
     ComPtr<ID3D11Texture2D> uvTexture_;
     ComPtr<ID3D11ShaderResourceView> uvView_;
     std::wstring url_;
     bool hardware_ = false;
-    int width_ = 0;
+    int width_ = 0;        // Visible size.
     int height_ = 0;
+    int codedWidth_ = 0;   // Decoded surface size.
+    int codedHeight_ = 0;
+    int apertureX_ = 0;    // Visible region offset in the decoded surface.
+    int apertureY_ = 0;
     LONGLONG timestamp_ = 0;
     int hwStage_ = 0;
     long hwCode_ = 0;
