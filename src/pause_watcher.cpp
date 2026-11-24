@@ -8,8 +8,6 @@
 namespace
 {
 
-PauseWatcher* g_watcher = nullptr;
-
 bool IsShellClassName(const wchar_t* className)
 {
     return std::wcscmp(className, L"Progman") == 0 ||
@@ -78,83 +76,15 @@ void PauseWatcher::Stop()
     }
 }
 
-void CALLBACK PauseWatcher::WinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
-                                          LONG idObject, LONG, DWORD, DWORD)
-{
-    if (g_watcher == nullptr)
-        return;
-
-    if (event == EVENT_SYSTEM_FOREGROUND ||
-        (event == EVENT_OBJECT_LOCATIONCHANGE && idObject == OBJID_WINDOW &&
-         hwnd == GetForegroundWindow()))
-    {
-        g_watcher->dirty_ = true;
-    }
-}
-
 void PauseWatcher::ThreadMain()
 {
-    threadId_ = GetCurrentThreadId();
-    g_watcher = this;
-
-    hookForeground_ = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-                                      nullptr, &PauseWatcher::WinEventProc, 0, 0,
-                                      WINEVENT_OUTOFCONTEXT);
-
-    hookLocation_ = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
-                                    nullptr, &PauseWatcher::WinEventProc, 0, 0,
-                                    WINEVENT_OUTOFCONTEXT);
-
-    Evaluate();
-    ULONGLONG lastEval = GetTickCount64();
-
-    bool quit = false;
-    while (!stop_.load(std::memory_order_relaxed) && !quit)
+    // Plain polling: no WinEvent hooks, so mouse movement in games never wakes
+    // this thread. ponytail: Sleep rounds to the 15.6 ms timer tick (~16 Hz), fine here.
+    while (!stop_.load(std::memory_order_relaxed))
     {
-        // Wait only for the rest of the 500 ms poll interval; irrelevant events
-        // (cursor moves) wake us but must not force an Evaluate.
-        const ULONGLONG elapsed = GetTickCount64() - lastEval;
-        MsgWaitForMultipleObjectsEx(0, nullptr,
-                                    elapsed < 500 ? static_cast<DWORD>(500 - elapsed) : 0,
-                                    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-
-        MSG message = {};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
-        {
-            if (message.message == WM_QUIT)
-            {
-                quit = true;
-                break;
-            }
-
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-
-        if (quit || stop_.load(std::memory_order_relaxed))
-            break;
-
-        if (dirty_ || GetTickCount64() - lastEval >= 500)
-        {
-            dirty_ = false;
-            Evaluate();
-            lastEval = GetTickCount64();
-        }
+        Evaluate();
+        Sleep(50);
     }
-
-    if (hookForeground_ != nullptr)
-    {
-        UnhookWinEvent(hookForeground_);
-        hookForeground_ = nullptr;
-    }
-
-    if (hookLocation_ != nullptr)
-    {
-        UnhookWinEvent(hookLocation_);
-        hookLocation_ = nullptr;
-    }
-
-    g_watcher = nullptr;
 }
 
 void PauseWatcher::Evaluate()
@@ -187,8 +117,19 @@ void PauseWatcher::Evaluate()
             if (windowRect.right <= windowRect.left || windowRect.bottom <= windowRect.top)
                 continue;
 
-            if (!ContainsRect(windowRect, monitorInfo.rcWork) &&
-                !ContainsRect(windowRect, monitorInfo.rcMonitor))
+            // Fullscreen only: a maximized window stops at the taskbar.
+            if (!ContainsRect(windowRect, monitorInfo.rcMonitor))
+                continue;
+
+            // Click-through overlays (Game Bar, Discord, GPU overlays) cover the
+            // screen without hiding it.
+            if (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TRANSPARENT)
+                continue;
+
+            // A captioned maximized window also covers the monitor when the taskbar
+            // auto-hides; that is maximized, not fullscreen.
+            if (IsZoomed(window) &&
+                (GetWindowLongPtrW(window, GWL_STYLE) & WS_CAPTION) == WS_CAPTION)
                 continue;
 
             // Expensive checks only for windows that actually cover the monitor.

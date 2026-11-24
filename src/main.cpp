@@ -340,7 +340,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
             if (!paused)
             {
                 paused = true;
-                Log(L"paused (maximized application detected)");
+                Log(L"paused (fullscreen application detected)");
+                // Hand our RAM back to the game; pages fault back in on resume.
+                SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                                         static_cast<SIZE_T>(-1));
             }
 
             // The watcher signals on every state change and the display poll

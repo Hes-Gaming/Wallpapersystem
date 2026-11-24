@@ -4,8 +4,8 @@
 #include <atomic>
 #include <thread>
 
-// Pauses wallpaper playback while another application is maximized or
-// fullscreen on the primary monitor. Runs its own message-pumping thread.
+// Pauses wallpaper playback while another application is fullscreen on the
+// primary monitor. Runs its own thread that polls ~20 times a second.
 class PauseWatcher
 {
 public:
@@ -28,9 +28,6 @@ public:
     long long evaluationTicks() const { return evalTicks_.load(std::memory_order_relaxed); }
 
 private:
-    static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
-                                      LONG idObject, LONG idChild,
-                                      DWORD eventThread, DWORD eventTime);
     void ThreadMain();
     void Evaluate();
 
@@ -41,8 +38,4 @@ private:
     std::atomic<long long> evalCount_{0};
     std::atomic<long long> evalTicks_{0};
     std::thread thread_;
-    DWORD threadId_ = 0;
-    bool dirty_ = false; // watcher thread only (set by WinEventProc inside PeekMessage)
-    HWINEVENTHOOK hookForeground_ = nullptr;
-    HWINEVENTHOOK hookLocation_ = nullptr;
 };
