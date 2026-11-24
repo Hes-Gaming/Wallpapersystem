@@ -454,23 +454,27 @@ HRESULT VideoDecoder::BlitTo(ID3D11Texture2D* target, int targetWidth, int targe
         hr = videoDevice_->CreateVideoProcessorOutputView(target, vpEnumerator_.Get(),
                                                           &outputDesc, &outputView_);
         if (SUCCEEDED(hr))
+        {
             outputTarget_ = target;
+
+            // Cover: fill the target and center-crop the excess of the visible region.
+            // Stream rects persist on the processor; every size change (display or
+            // media type) releases the output target, so they are recomputed here.
+            const double scale = (std::max)(static_cast<double>(targetWidth) / width_,
+                                            static_cast<double>(targetHeight) / height_);
+            const LONG cropWidth = static_cast<LONG>(targetWidth / scale + 0.5);
+            const LONG cropHeight = static_cast<LONG>(targetHeight / scale + 0.5);
+            const LONG left = apertureX_ + (width_ - cropWidth) / 2;
+            const LONG top = apertureY_ + (height_ - cropHeight) / 2;
+            const RECT sourceRect = { left, top, left + cropWidth, top + cropHeight };
+            const RECT destRect = { 0, 0, targetWidth, targetHeight };
+            videoContext_->VideoProcessorSetStreamSourceRect(vp_.Get(), 0, TRUE, &sourceRect);
+            videoContext_->VideoProcessorSetStreamDestRect(vp_.Get(), 0, TRUE, &destRect);
+        }
     }
 
     if (SUCCEEDED(hr))
     {
-        // Cover: fill the target and center-crop the excess of the visible region.
-        const double scale = (std::max)(static_cast<double>(targetWidth) / width_,
-                                        static_cast<double>(targetHeight) / height_);
-        const LONG cropWidth = static_cast<LONG>(targetWidth / scale + 0.5);
-        const LONG cropHeight = static_cast<LONG>(targetHeight / scale + 0.5);
-        const LONG left = apertureX_ + (width_ - cropWidth) / 2;
-        const LONG top = apertureY_ + (height_ - cropHeight) / 2;
-        const RECT sourceRect = { left, top, left + cropWidth, top + cropHeight };
-        const RECT destRect = { 0, 0, targetWidth, targetHeight };
-        videoContext_->VideoProcessorSetStreamSourceRect(vp_.Get(), 0, TRUE, &sourceRect);
-        videoContext_->VideoProcessorSetStreamDestRect(vp_.Get(), 0, TRUE, &destRect);
-
         D3D11_VIDEO_PROCESSOR_STREAM stream = {};
         stream.Enable = TRUE;
         stream.pInputSurface = currentInput_;

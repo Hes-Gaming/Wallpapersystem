@@ -210,6 +210,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
     const int benchSeconds = benchArg ? (std::max)(1, _wtoi(benchArg + 7)) : 0;
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    // A wallpaper should yield the CPU to whatever the user is actually running.
+    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 
     HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, L"Local\\WallpaperSystemInstance");
     if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS)
@@ -341,9 +343,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
                 Log(L"paused (maximized application detected)");
             }
 
+            // The watcher signals on every state change and the display poll
+            // runs on resume, so there is nothing to wake up for until then.
             HANDLE wake = watcher.WakeEvent();
             MsgWaitForMultipleObjectsEx(wake ? 1 : 0, wake ? &wake : nullptr,
-                                        250, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                                        wake ? INFINITE : 250, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             continue;
         }
 
@@ -351,6 +355,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
         {
             paused = false;
             pacingValid = false;
+            lastFrameTick = GetTickCount();  // A long pause must not trip the watchdog.
             Log(L"resumed");
         }
 
