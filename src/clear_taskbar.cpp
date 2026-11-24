@@ -56,6 +56,19 @@ public:
     IFACEMETHODIMP OnVisualTreeChange(ParentChildRelation relation, VisualElement element,
                                       VisualMutationType mutation) override
     {
+        // The callee owns these strings (TranslucentTB frees them the same way).
+        struct FreeStrings
+        {
+            VisualElement& e;
+            ~FreeStrings()
+            {
+                SysFreeString(e.Type);
+                SysFreeString(e.Name);
+                SysFreeString(e.SrcInfo.FileName);
+                SysFreeString(e.SrcInfo.Hash);
+            }
+        } freeStrings{ element };
+
         if (mutation == Remove)
         {
             m_backgrounds.erase(element.Handle);

@@ -13,6 +13,7 @@
 #include <cwchar>
 #include <share.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "clear_taskbar.h"
@@ -271,7 +272,7 @@ bool ModuleLoaded(DWORD pid, const wchar_t* name)
 }
 
 // Has XAML diagnostics load ClearTaskbar.dll into Explorer (TranslucentTB's method).
-HRESULT InjectClearTaskbar(DWORD pid)
+HRESULT InjectClearTaskbarOnThisThread(DWORD pid)
 {
     using InitializeXamlDiagnosticsExFn =
         HRESULT(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSID, LPCWSTR);
@@ -294,6 +295,20 @@ HRESULT InjectClearTaskbar(DWORD pid)
         if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
             break;
     }
+    return hr;
+}
+
+// XAML diagnostics initializes only once per calling thread (later calls return
+// S_OK and do nothing), so each attempt runs on a fresh thread.
+HRESULT InjectClearTaskbar(DWORD pid)
+{
+    HRESULT hr = E_FAIL;
+    std::thread([&] {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        hr = InjectClearTaskbarOnThisThread(pid);
+        if (SUCCEEDED(com))
+            CoUninitialize();
+    }).join();
     return hr;
 }
 
@@ -596,6 +611,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
         frameTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
 
     bool running = true;
+    bool relaunch = false;
     bool paused = false;
     bool firstFrame = false;
     bool pacingValid = false;
@@ -777,6 +793,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
 
         if (tick - lastParentCheck > 2000)
         {
+            // An Explorer restart destroys our window along with its desktop.
+            if (!IsWindow(renderer.window()))
+            {
+                Log(L"wallpaper window destroyed (explorer restarted), relaunching");
+                relaunch = benchSeconds == 0;
+                break;
+            }
             renderer.EnsureDesktopParent();
             if (config.fullTransparency && benchSeconds == 0)
                 KeepTaskbarClear();
@@ -796,5 +819,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
     CloseLog();
     if (instanceMutex)
         CloseHandle(instanceMutex);
+
+    // After the mutex is gone; the new instance waits for Explorer's desktop itself.
+    wchar_t exe[MAX_PATH] = {};
+    if (relaunch && GetModuleFileNameW(nullptr, exe, MAX_PATH))
+    {
+        STARTUPINFOW startup = { sizeof(startup) };
+        PROCESS_INFORMATION process = {};
+        if (CreateProcessW(exe, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup,
+                           &process))
+        {
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+    }
     return 0;
 }

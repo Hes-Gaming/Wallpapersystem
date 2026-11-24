@@ -61,4 +61,4 @@ target_link_libraries(WallpaperSystem PRIVATE
     gdi32
 )
 
-target_link_libraries(ClearTaskbar PRIVATE runtimeobject ole32)
+target_link_libraries(ClearTaskbar PRIVATE runtimeobject ole32 oleaut32)
