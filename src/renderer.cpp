@@ -150,6 +150,11 @@ ComPtr<IDXGIAdapter1> FindPrimaryMonitorAdapter()
 // owns the desktop wallpaper, so our video window must live inside it.
 HWND FindWallpaperWorkerWindow()
 {
+    // Windows 11 24H2+: the wallpaper WorkerW is a child of Progman, below the icons.
+    if (HWND progman = FindWindowW(L"Progman", nullptr))
+        if (HWND inner = FindWindowExW(progman, nullptr, L"WorkerW", nullptr))
+            return inner;
+
     HWND iconHost = nullptr;
     EnumWindows(EnumIconHostProc, reinterpret_cast<LPARAM>(&iconHost));
 
@@ -307,9 +312,10 @@ bool Renderer::AttachToDesktop()
     if (progman)
     {
         DWORD_PTR result = 0;
-        SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, &result);
+        // 0xD/1: newer Windows 11 builds ignore 0x052C sent with 0/0.
+        SendMessageTimeoutW(progman, 0x052C, 0xD, 1, SMTO_NORMAL, 1000, &result);
         if (!FindWallpaperWorkerWindow())
-            SendMessageTimeoutW(progman, 0x052C, 0, 0, SMTO_NORMAL, 1000, &result);
+            SendMessageTimeoutW(progman, 0x052C, 0xD, 1, SMTO_NORMAL, 1000, &result);
     }
 
     HWND parent = FindWallpaperWorkerWindow();
