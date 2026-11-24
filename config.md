@@ -6,4 +6,4 @@
 # StartWithWindows = true | false  (applied the next time the app runs)
 StartWithWindows = true
 
-Wallpaper = 1673464449-1673464449-shinobi-master-rias-2-anime.mp4
+Wallpaper = label-pixelated-heart-goddess-of-victory-nikke-moewalls-com.mp4
