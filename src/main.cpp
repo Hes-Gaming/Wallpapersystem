@@ -201,6 +201,121 @@ void SyncStartup(bool enable)
         Log(L"warning: failed to register startup entry (%ld)", static_cast<long>(status));
 }
 
+// Container-level frame size and duration: no decoder is loaded, so this is cheap.
+bool ProbeVideo(const std::wstring& path, UINT32& width, UINT32& height, double& seconds)
+{
+    ComPtr<IMFSourceReader> reader;
+    ComPtr<IMFMediaType> type;
+    if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader)) ||
+        FAILED(reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM),
+                                          0, &type)) ||
+        FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height)))
+        return false;
+
+    PROPVARIANT duration;
+    PropVariantInit(&duration);
+    seconds = 0.0;
+    if (SUCCEEDED(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE),
+                                                   MF_PD_DURATION, &duration)) &&
+        duration.vt == VT_UI8)
+        seconds = static_cast<double>(duration.uhVal.QuadPart) / 10000000.0;
+    PropVariantClear(&duration);
+    return true;
+}
+
+// An empty "<copy>.failed" file stops a failing re-encode from retrying every
+// startup; delete it to try again.
+void MarkEncodeFailed(const std::wstring& cached)
+{
+    const HANDLE marker = CreateFileW((cached + L".failed").c_str(), GENERIC_WRITE, 0, nullptr,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (marker != INVALID_HANDLE_VALUE)
+        CloseHandle(marker);
+}
+
+// Once per wallpaper and screen size: when the video is larger than the screen or
+// over 8 Mbps, ffmpeg (on PATH or next to the exe) re-encodes it into
+// wallpapers\optimized. Later startups find the copy and skip all of this.
+// ponytail: fixed 8 Mbps cap tuned for 1080p; scale it with screen pixels for 4K.
+std::wstring PrepareWallpaper(const std::wstring& original)
+{
+    MONITORINFO monitor = { sizeof(monitor) };
+    WIN32_FILE_ATTRIBUTE_DATA source = {};
+    if (!GetMonitorInfoW(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &monitor) ||
+        !GetFileAttributesExW(original.c_str(), GetFileExInfoStandard, &source))
+        return original;
+    const UINT32 screenWidth = static_cast<UINT32>(monitor.rcMonitor.right - monitor.rcMonitor.left);
+    const UINT32 screenHeight = static_cast<UINT32>(monitor.rcMonitor.bottom - monitor.rcMonitor.top);
+    const ULONGLONG bytes = (static_cast<ULONGLONG>(source.nFileSizeHigh) << 32) | source.nFileSizeLow;
+
+    // The original's size in the name means a replaced video gets a new copy.
+    const size_t slash = original.find_last_of(L"\\/");
+    const size_t dot = original.find_last_of(L'.');
+    const std::wstring folder = original.substr(0, slash) + L"\\optimized";
+    const std::wstring stem = original.substr(slash + 1, (dot > slash ? dot : original.size()) - slash - 1);
+    const std::wstring cached = folder + L"\\" + stem + L"_" + std::to_wstring(screenWidth) + L"x" +
+                                std::to_wstring(screenHeight) + L"_" + std::to_wstring(bytes) + L".mp4";
+    if (GetFileAttributesW(cached.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return cached;
+    if (GetFileAttributesW((cached + L".failed").c_str()) != INVALID_FILE_ATTRIBUTES)
+        return original;
+
+    UINT32 width = 0, height = 0;
+    double seconds = 0.0;
+    if (!ProbeVideo(original, width, height, seconds))
+        return original;
+    const double mbps = seconds > 0.0 ? static_cast<double>(bytes) * 8.0 / seconds / 1e6 : 0.0;
+    const bool larger = width > screenWidth || height > screenHeight;
+    Log(L"wallpaper source: %ux%u %.1f Mbps (screen %ux%u)", width, height, mbps,
+        screenWidth, screenHeight);
+    if (!larger && mbps <= 8.0)
+        return original;
+
+    // Same center "cover" crop the renderer does, so the picture is unchanged.
+    const std::wstring size = std::to_wstring(screenWidth) + L":" + std::to_wstring(screenHeight);
+    const std::wstring partial = cached + L".part";
+    std::wstring command = L"ffmpeg -hide_banner -loglevel error -nostdin -y -i \"" + original +
+                           L"\" -map 0:v:0 ";
+    if (larger)
+        command += L"-vf \"scale=" + size + L":force_original_aspect_ratio=increase,crop=" + size + L"\" ";
+    // Cap at the source bitrate too, so a crop-only re-encode never grows the file.
+    const int capKbps = static_cast<int>((mbps > 0.0 ? (std::min)(mbps, 8.0) : 8.0) * 1000.0);
+    command += L"-c:v libx264 -preset medium -crf 20 -maxrate " + std::to_wstring(capKbps) +
+               L"k -bufsize " + std::to_wstring(capKbps * 2) + L"k -pix_fmt yuv420p "
+               L"-movflags +faststart -f mp4 \"" + partial + L"\"";
+
+    CreateDirectoryW(folder.c_str(), nullptr);
+    Log(L"re-encoding wallpaper (one time): %ls", command.c_str());
+    STARTUPINFOW startup = { sizeof(startup) };
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(nullptr, &command[0], nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr,
+                        &startup, &process))
+    {
+        Log(L"ffmpeg not found (%lu), using the original video", GetLastError());
+        return original;
+    }
+
+    DWORD exitCode = 1;
+    if (WaitForSingleObject(process.hProcess, 10 * 60 * 1000) != WAIT_OBJECT_0)
+        TerminateProcess(process.hProcess, 1);
+    else
+        GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+
+    // Written under a temporary name, so a killed encode never leaves a broken copy.
+    if (exitCode != 0 || !MoveFileExW(partial.c_str(), cached.c_str(), MOVEFILE_REPLACE_EXISTING))
+    {
+        Log(L"re-encode failed (exit %lu), using the original video", exitCode);
+        DeleteFileW(partial.c_str());
+        MarkEncodeFailed(cached);
+        return original;
+    }
+    Log(L"re-encode done: %ls", cached.c_str());
+    return cached;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
@@ -250,6 +365,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
     Log(L"process id: %lu", static_cast<unsigned long>(GetCurrentProcessId()));
     if (benchSeconds == 0)
         SyncStartup(config.startWithWindows);
+    // Before the wallpaper window exists, so the normal desktop shows during a re-encode.
+    const std::wstring videoPath = PrepareWallpaper(config.wallpaperPath);
 
     // At login the Run key can fire before Explorer has created the desktop.
     for (int i = 0; i < 60 && !FindWindowW(L"Progman", nullptr); ++i)
@@ -269,7 +386,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
     }
 
     VideoDecoder decoder;
-    if (!decoder.Open(config.wallpaperPath, renderer.device()))
+    bool opened = decoder.Open(videoPath, renderer.device());
+    if (!opened && videoPath != config.wallpaperPath)
+    {
+        // A bad optimized copy: drop it, mark it failed and play the original.
+        Log(L"optimized copy failed to open, using the original video");
+        DeleteFileW(videoPath.c_str());
+        MarkEncodeFailed(videoPath);
+        opened = decoder.Open(config.wallpaperPath, renderer.device());
+    }
+    if (!opened)
     {
         Fatal(L"Failed to open the wallpaper video. Only H.264 .mp4 files are supported.");
         renderer.Destroy();
