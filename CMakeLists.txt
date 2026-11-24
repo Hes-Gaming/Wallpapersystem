@@ -38,6 +38,7 @@ target_link_libraries(WallpaperSystem PRIVATE
     mfuuid
     dwmapi
     ole32
+    advapi32
     user32
     gdi32
 )

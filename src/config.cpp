@@ -211,7 +211,14 @@ AppConfig LoadConfig()
                 continue;
 
             const std::string key = Trim(trimmed.substr(0, equals));
-            if (_stricmp(key.c_str(), "wallpaper") != 0)
+            if (_stricmp(key.c_str(), "startwithwindows") == 0)
+            {
+                const std::string flag = Trim(trimmed.substr(equals + 1));
+                config.startWithWindows = _stricmp(flag.c_str(), "true") == 0 ||
+                                          _stricmp(flag.c_str(), "yes") == 0 || flag == "1";
+                continue;
+            }
+            if (found || _stricmp(key.c_str(), "wallpaper") != 0)
                 continue;
 
             std::string parsed = Trim(trimmed.substr(equals + 1));
@@ -224,7 +231,6 @@ AppConfig LoadConfig()
 
             value = parsed;
             found = true;
-            break;
         }
 
         if (!found)

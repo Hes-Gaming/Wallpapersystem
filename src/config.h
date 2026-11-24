@@ -5,6 +5,7 @@
 struct AppConfig
 {
     std::wstring wallpaperPath;  // Absolute path to the wallpaper video.
+    bool startWithWindows = false;
     bool valid = false;
     std::wstring error;          // Human readable reason when valid == false.
 };

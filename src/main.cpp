@@ -178,6 +178,29 @@ void LogBench(const BenchStats& bench, LONGLONG now, LONGLONG frequency,
         local.CurrentUsage / mb, nonLocal.CurrentUsage / mb, startupMs);
 }
 
+// Mirrors config.md's StartWithWindows into HKCU\...\Run (per-user, no admin).
+void SyncStartup(bool enable)
+{
+    const wchar_t* const runKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const wchar_t* const valueName = L"WallpaperSystem";
+    if (!enable)
+    {
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, runKey, valueName);
+        return;
+    }
+
+    wchar_t exe[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+        return;
+    const std::wstring command = L"\"" + std::wstring(exe) + L"\"";
+    const LSTATUS status = RegSetKeyValueW(HKEY_CURRENT_USER, runKey, valueName, REG_SZ,
+                                           command.c_str(),
+                                           static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    if (status != ERROR_SUCCESS)
+        Log(L"warning: failed to register startup entry (%ld)", static_cast<long>(status));
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
@@ -223,6 +246,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
     }
     Log(L"wallpaper: %ls", config.wallpaperPath.c_str());
     Log(L"process id: %lu", static_cast<unsigned long>(GetCurrentProcessId()));
+    if (benchSeconds == 0)
+        SyncStartup(config.startWithWindows);
+
+    // At login the Run key can fire before Explorer has created the desktop.
+    for (int i = 0; i < 60 && !FindWindowW(L"Progman", nullptr); ++i)
+        Sleep(500);
 
     Renderer renderer;
     if (!renderer.Create(instance))
