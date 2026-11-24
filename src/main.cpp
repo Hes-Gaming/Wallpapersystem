@@ -488,10 +488,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
             Log(L"resumed");
         }
 
-        const LONGLONG decodeStart = QueryQpc();
+        // Decode/render timings only feed --bench.
+        const bool benchmarking = benchSeconds > 0;
+        bool frameOk = false;
+        const LONGLONG decodeStart = benchmarking ? QueryQpc() : 0;
         DecodedFrame frame = {};
         const DecodeResult result = decoder.DecodeNext(frame);
-        const LONGLONG decodeTicks = QueryQpc() - decodeStart;
+        const LONGLONG decodeTicks = benchmarking ? QueryQpc() - decodeStart : 0;
         if (result == DecodeResult::Frame)
         {
             LONGLONG pts = decoder.timestamp();
@@ -516,17 +519,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
                 WaitUntilQpc(target, frameTimer, qpcFrequency);
 
             renderer.WaitForFrameLatency();
-            const LONGLONG renderStart = QueryQpc();
+            const LONGLONG renderStart = benchmarking ? QueryQpc() : 0;
             HRESULT presentResult = frame.hardware
                 ? decoder.BlitTo(renderer.backBuffer(), renderer.width(), renderer.height())
                 : renderer.RenderFrame(frame.srv, frame.srvUV, decoder.width(), decoder.height());
             if (SUCCEEDED(presentResult))
                 presentResult = renderer.Present();
-            const LONGLONG presented = QueryQpc();
-            if (SUCCEEDED(presentResult))
-                lastFrameTick = GetTickCount();  // Persistent failures trip the 5 s watchdog.
+            const LONGLONG presented = (benchmarking || !firstFrame) ? QueryQpc() : 0;
+            frameOk = SUCCEEDED(presentResult);  // Persistent failures trip the 5 s watchdog.
 
-            if (benchSeconds > 0 && firstFrame)
+            if (benchmarking && firstFrame)
             {
                 if (bench.measuring)
                 {
@@ -574,6 +576,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
                 startupMs = static_cast<double>(presented - startQpc) * 1000.0 / qpcFrequency;
                 bench.start = presented + 2 * qpcFrequency;
                 Log(L"first frame presented (%.1f ms after start)", startupMs);
+                // Startup-only memory (probing, decoder setup) goes back to the system.
+                SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                                         static_cast<SIZE_T>(-1));
             }
         }
         else if (result == DecodeResult::EndOfStream)
@@ -593,17 +598,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
             Sleep(1);
         }
 
-        if (GetTickCount() - lastFrameTick > 5000)
+        const DWORD tick = GetTickCount();
+        if (frameOk)
+            lastFrameTick = tick;
+        if (tick - lastFrameTick > 5000)
         {
             Log(L"no frames decoded for 5 seconds, exiting");
             break;
         }
 
-        const DWORD now = GetTickCount();
-        if (now - lastParentCheck > 2000)
+        if (tick - lastParentCheck > 2000)
         {
             renderer.EnsureDesktopParent();
-            lastParentCheck = now;
+            lastParentCheck = tick;
         }
     }
 
