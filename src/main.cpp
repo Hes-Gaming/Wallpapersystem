@@ -2,6 +2,7 @@
 #include <mfapi.h>
 #include <dxgi1_4.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 
 #include <intrin.h>
 
@@ -14,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "clear_taskbar.h"
 #include "config.h"
 #include "video_decoder.h"
 #include "renderer.h"
@@ -201,6 +203,166 @@ void SyncStartup(bool enable)
         Log(L"warning: failed to register startup entry (%ld)", static_cast<long>(status));
 }
 
+// Writes an HKCU DWORD; returns true only when the value actually changed.
+bool SetUserDword(const wchar_t* key, const wchar_t* name, DWORD wanted)
+{
+    DWORD current = 0;
+    DWORD size = sizeof(current);
+    if (RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_DWORD, nullptr, &current,
+                     &size) == ERROR_SUCCESS && current == wanted)
+        return false;
+
+    const LSTATUS status =
+        RegSetKeyValueW(HKEY_CURRENT_USER, key, name, REG_DWORD, &wanted, sizeof(wanted));
+    if (status != ERROR_SUCCESS)
+    {
+        Log(L"warning: failed to set %ls (%ld)", name, static_cast<long>(status));
+        return false;
+    }
+    return true;
+}
+
+// Mirrors config.md's Transparency into Windows' own "Transparency effects"
+// setting (Start, taskbar, title bars, borders). When on, the accent color tint
+// on Start/taskbar and title bars is turned off too, since it hides the wallpaper.
+// With a clear taskbar the Start/taskbar tint only colors Start, so it is left to
+// the user's Windows setting. Broadcasts only on change.
+void SyncTransparency(bool enable, bool clearTaskbar)
+{
+    const wchar_t* const personalize =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+    bool changed = SetUserDword(personalize, L"EnableTransparency", enable ? 1 : 0);
+    if (enable)
+    {
+        if (!clearTaskbar)
+            changed |= SetUserDword(personalize, L"ColorPrevalence", 0);
+        changed |= SetUserDword(L"Software\\Microsoft\\Windows\\DWM", L"ColorPrevalence", 0);
+    }
+    if (!changed)
+        return;
+    // Explorer and DWM re-read the theme on this broadcast, same as the Settings toggle.
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                        reinterpret_cast<LPARAM>(L"ImmersiveColorSet"), SMTO_ABORTIFHUNG, 1000,
+                        nullptr);
+    Log(L"transparency effects %ls", enable ? L"enabled" : L"disabled");
+}
+
+constexpr wchar_t kClearTaskbarDll[] = L"ClearTaskbar.dll";
+
+DWORD TaskbarProcessId()
+{
+    DWORD pid = 0;
+    const HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    return taskbar && GetWindowThreadProcessId(taskbar, &pid) ? pid : 0;
+}
+
+bool ModuleLoaded(DWORD pid, const wchar_t* name)
+{
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return false;
+    MODULEENTRY32W entry = { sizeof(entry) };
+    bool found = false;
+    for (BOOL ok = Module32FirstW(snapshot, &entry); ok && !found;
+         ok = Module32NextW(snapshot, &entry))
+        found = _wcsicmp(entry.szModule, name) == 0;
+    CloseHandle(snapshot);
+    return found;
+}
+
+// Has XAML diagnostics load ClearTaskbar.dll into Explorer (TranslucentTB's method).
+HRESULT InjectClearTaskbar(DWORD pid)
+{
+    using InitializeXamlDiagnosticsExFn =
+        HRESULT(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSID, LPCWSTR);
+    static const HMODULE xaml =
+        LoadLibraryExW(L"Windows.UI.Xaml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto initialize = xaml ? reinterpret_cast<InitializeXamlDiagnosticsExFn>(
+                                       GetProcAddress(xaml, "InitializeXamlDiagnosticsEx"))
+                                 : nullptr;
+    if (!initialize)
+        return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+
+    const std::wstring dll = GetExeDirectory() + L"\\" + kClearTaskbarDll;
+    HRESULT hr = E_FAIL;
+    // Endpoint names can be taken by other diagnostics clients; try the next one.
+    for (int i = 1; i <= 60; ++i)
+    {
+        const std::wstring endpoint = L"VisualDiagConnection" + std::to_wstring(i);
+        hr = initialize(endpoint.c_str(), pid, L"", dll.c_str(), __uuidof(ClearTaskbarTap),
+                        nullptr);
+        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
+            break;
+    }
+    return hr;
+}
+
+// Called every 2 s from the render loop, so it never runs while the wallpaper is
+// paused. Injects once per Explorer instance; after that it is a single FindWindow.
+void KeepTaskbarClear()
+{
+    static DWORD seenPid = 0;
+    static int attempts = 0;  // -1 once done for this Explorer.
+    const DWORD pid = TaskbarProcessId();
+    if (!pid)
+        return;
+    if (pid != seenPid)
+    {
+        seenPid = pid;
+        attempts = 0;
+    }
+    if (attempts < 0 || attempts >= 15)
+        return;
+
+    if (ModuleLoaded(pid, kClearTaskbarDll))
+    {
+        attempts = -1;
+        return;
+    }
+    const HRESULT hr = InjectClearTaskbar(pid);
+    if (SUCCEEDED(hr))
+    {
+        attempts = -1;
+        Log(L"clear taskbar loaded into explorer %lu", pid);
+    }
+    else if (++attempts == 15)
+    {
+        Log(L"warning: clear taskbar failed (0x%08lX)", static_cast<unsigned long>(hr));
+    }
+}
+
+// FullTransparency off: the DLL can only leave Explorer with Explorer itself.
+void RemoveTaskbarClear()
+{
+    const DWORD pid = TaskbarProcessId();
+    if (!pid || !ModuleLoaded(pid, kClearTaskbarDll))
+        return;
+
+    Log(L"restarting explorer to remove the clear taskbar");
+    const HANDLE explorer = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (!explorer)
+        return;
+    TerminateProcess(explorer, 1);
+    WaitForSingleObject(explorer, 5000);
+    CloseHandle(explorer);
+
+    // Winlogon restarts the shell by itself; only start it if that did not happen.
+    for (int i = 0; i < 40 && !TaskbarProcessId(); ++i)
+        Sleep(250);
+    if (TaskbarProcessId())
+        return;
+    wchar_t command[] = L"explorer.exe";
+    STARTUPINFOW startup = { sizeof(startup) };
+    PROCESS_INFORMATION process = {};
+    // Explicit class, or Explorer would inherit our below-normal priority.
+    if (CreateProcessW(nullptr, command, nullptr, nullptr, FALSE, NORMAL_PRIORITY_CLASS, nullptr,
+                       nullptr, &startup, &process))
+    {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+}
+
 // Container-level frame size and duration: no decoder is loaded, so this is cheap.
 bool ProbeVideo(const std::wstring& path, UINT32& width, UINT32& height, double& seconds)
 {
@@ -364,7 +526,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
     Log(L"wallpaper: %ls", config.wallpaperPath.c_str());
     Log(L"process id: %lu", static_cast<unsigned long>(GetCurrentProcessId()));
     if (benchSeconds == 0)
+    {
         SyncStartup(config.startWithWindows);
+        if (config.transparency >= 0)
+            SyncTransparency(config.transparency == 1, config.fullTransparency);
+        if (!config.fullTransparency)
+            RemoveTaskbarClear();
+    }
     // Before the wallpaper window exists, so the normal desktop shows during a re-encode.
     const std::wstring videoPath = PrepareWallpaper(config.wallpaperPath);
 
@@ -610,6 +778,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int)
         if (tick - lastParentCheck > 2000)
         {
             renderer.EnsureDesktopParent();
+            if (config.fullTransparency && benchSeconds == 0)
+                KeepTaskbarClear();
             lastParentCheck = tick;
         }
     }

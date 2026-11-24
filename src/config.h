@@ -6,6 +6,8 @@ struct AppConfig
 {
     std::wstring wallpaperPath;  // Absolute path to the wallpaper video.
     bool startWithWindows = false;
+    int transparency = -1;       // 1 on, 0 off, -1 not in config.md (leave Windows alone).
+    bool fullTransparency = false;  // Fully clear taskbar (ClearTaskbar.dll in Explorer).
     bool valid = false;
     std::wstring error;          // Human readable reason when valid == false.
 };
